@@ -231,6 +231,17 @@ class ProbesDatabase:
             not_null_condition="r.absolute_pressure_kpa IS NOT NULL",
             limit=limit
         )
+    
+    def getGaugePressure(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        return self._get_readings(
+            ids, start, end,
+            type=type,
+            mmodule=module,
+            column='gauge_pressure_kpa',
+            alias='pressão_barométrica_kpa',
+            not_null_condition='r.gauge_pression_kpa IS NOT NULL',
+            limit=limit
+        )
 
     def getTemperature(self, ids, start=None, end=None, type='any', module='any', limit=None):
         return self._get_readings(
@@ -253,9 +264,170 @@ class ProbesDatabase:
             not_null_condition="r.humidity_percent IS NOT NULL",
             limit=limit
         )
+    
+    def getRSSI(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        return self._get_readings(
+            ids, start, end,
+            type=type,
+            module=module,
+            column='rssi',
+            alias='rssi',
+            not_null_condition='r.rssi IS NOT NULL',
+            limit=limit)
+    
+    def getO2(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        return self._get_readings(
+            ids, start, end,
+            type=type,
+            module=module,
+            column='o2_percent',
+            alias='o2_por_cento',
+            not_null_condition='r.o2_percent IS NOT NULL',
+            limit=limit)
+    
+    def getCH4(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        return self._get_readings(
+            ids, start, end,
+            type=type,
+            module=module,
+            column='ch4_percent_lel',
+            alias='ch4_por_cento',
+            not_null_condition='r.ch4_percent_lel IS NOT NULL',
+            limit=limit)
 
+    def getCO(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        return self._get_readings(
+            ids, start, end,
+            type=type,
+            module=module,
+            column='co_ppm',
+            alias='co_ppm',
+            not_null_condition='r.co_ppm IS NOT NULL',
+            limit=limit)
+
+    def getH2S(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        return self._get_readings(
+            ids, start, end,
+            type=type,
+            module=module,
+            column='h2s_ppm',
+            alias='h2s_ppm',
+            not_null_condition='r.h2s_ppm IS NOT NULL',
+            limit=limit)
+    
+    def getNH3(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        return self._get_readings(
+            ids, start, end,
+            type=type,
+            module=module,
+            column='nh3_ppm',
+            alias='nh3_ppm',
+            not_null_condition='r.nh3_ppm IS NOT NULL',
+            limit=limit)
+    
+    def getN2O(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        return self._get_readings(
+            ids, start, end,
+            type=type,
+            module=module,
+            column='n2o_ppm',
+            alias='n2o_ppm',
+            not_null_condition='r.n2o_ppm IS NOT NULL',
+            limit=limit)
+    
+    def getBatteryVoltage(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        return self._get_readings(
+            ids, start, end,
+            type=type,
+            module=module,
+            column='battery_voltage',
+            alias='tensão_na_bateria',
+            not_null_condition='r.battery_voltage IS NOT NULL',
+            limit=limit)
+    
+    def getBatterySoC(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        return self._get_readings(
+            ids, start, end,
+            type=type,
+            module=module,
+            column='battery_soc_percent',
+            alias='estado_de_carga_da_bateria',
+            not_null_condition='r.battery_soc_percent IS NOT NULL',
+            limit=limit)
+    
+    def getBatterySoH(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        return self._get_readings(
+            ids, start, end,
+            type=type,
+            module=module,
+            column='battery_soh_percent',
+            alias='estado_de_saúde_da_bateria',
+            not_null_condition='r.battery_soh_percent IS NOT NULL',
+            limit=limit)
+    
     # ---------------------------------------------------------
     # Versões em Pandas – com limit opcional
+    
+    def getGaugePressureAsPandas(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        res = self.getGaugePressure(ids, start, end, type, module, limit)
+        if res is not None:
+            return pd.DataFrame(res, columns=['sonda', 'gauge_pressure_kpa', 'timestamp'])
+        return None
+    
+    def getBatterySoHasPandas(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        res = self.getBatterySoH(ids, start, end, type, module, limit)
+        if res is not None:
+            return pd.DataFrame(res, columns=['sonda', 'battery_soh_percent', 'timestamp'])
+        return None
+    
+    def getBatterySoCasPandas(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        res = self.getBatterySoC(ids, start, end, type, module, limit)
+        if res is not None:
+            return pd.DataFrame(res, columns=['sonda', 'battery_soc_percent', 'timestamp'])
+        return None
+    
+    def getBatteryVoltageAsPandas(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        res = self.getBatteryVoltage(ids, start, end, type, module, limit)
+        if res is not None:
+            return pd.DataFrame(res, columns=['sonda', 'tensão da bateria', 'timestamp'])
+        return None
+    
+    def getN2OasPandas(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        res = self.getN2O(ids, start, end, type, module, limit)
+        if res is not None:
+            return pd.DataFrame(res, columns=['sonda', 'n2o_ppm', 'timestamp'])
+        return None
+    
+    def getNH3asPandas(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        res = self.getNH3(ids, start, end, type, module, limit)
+        if res is not None:
+            return pd.DataFrame(res, columns=['sonda', 'nh3_ppm', 'timestamp'])
+        return None
+    
+    def getH2SasPandas(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        res = self.getH2S(ids, start, end, type, module, limit)
+        if res is not None:
+            return pd.DataFrame(res, columns=['sonda', 'h2s_ppm', 'timestamp'])
+        return None
+    
+    def getCOasPandas(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        res = self.getCO(ids, start, end, type, module, limit)
+        if res is not None:
+            return pd.DataFrame(res, columns=['sonda', 'co_ppm', 'timestamp'])
+        return None
+    
+    def getCH4asPandas(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        res = self.getCH4(ids, start, end, type, module, limit)
+        if res is not None:
+            return pd.DataFrame(res, columns=['sonda', 'ch4_percent_lel', 'timestamp'])
+        return None
+    
+    def getO2asPandas(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        res = self.getO2(ids, start, end, type, module, limit)
+        if res is not None:
+            return pd.DataFrame(res, columns=['sonda', 'o2_percent', 'timestamp'])
+        return None
+    
     def getCO2asPandas(self, ids, start=None, end=None, limit=None):
         res = self.getCO2(ids, start, end, limit)
         if res is not None:
@@ -278,6 +450,12 @@ class ProbesDatabase:
         res = self.getHumidity(ids, start, end, type, module, limit)
         if res is not None:
             return pd.DataFrame(res, columns=['sonda', 'umidade_por_cento', 'timestamp'])
+        return None
+    
+    def getRSSIasPandas(self, ids, start=None, end=None, type='any', module='any', limit=None):
+        res = self.getRSSI(ids, start, end, type, module,limit)
+        if res is not None:
+            return pd.DataFrame(res, columns=['sonda', 'rssi', 'timestamp'])
         return None
     
     # ---------------------------------------------------------------
@@ -310,7 +488,8 @@ class ProbesDatabase:
             'co2':   'co2_ppm',
             'temp':  'temperature_c',
             'press': 'absolute_pressure_kpa',
-            'hum':   'humidity_percent'
+            'hum':   'humidity_percent',
+            'rssi':  'rssi'
         }
 
         # Se variables for None, usa todas
@@ -512,6 +691,15 @@ def main():
     phum = pdb.getHumidityAsPandas((22, 26, 28), start="2026/08/10 0:0:0", end="2026/08/18 23:59:59", type='gas', module='bme', limit=10)
     print(f"{phum}")
     
+    # teste pegar RSSI
+    print("RSSI")
+    rssi = pdb.getRSSI((22, 26,28), start="2026/08/10 0:0:0", end="2026/08/20 23:59:59", type='gas', module='sdc', limit=10)
+    print(f"{rssi}")
+    
+    # teste pegar RSSI pandas
+    print("RSSI PANDAS")
+    rssi = pdb.getRSSIasPandas((22, 26,28), start="2026/08/10 0:0:0", end="2026/08/20 23:59:59", type='gas', module='sdc', limit=10)
+    
     # teste pandas multivariáveis
     # Obtém CO2, temperatura e pressão para as sondas 22, 26, 28
     # entre duas datas, sem limite
@@ -520,7 +708,7 @@ def main():
         ids=[22, 26, 28],
         start="2026/08/10 0:0:0",
         end="2026/08/18 23:59:59",
-        variables=['co2', 'temp', 'hum'],
+        variables=['co2', 'temp', 'hum', 'rssi'],
         module='sdc', limit=10)
     print(f"{df}\n")
     df = pdb.getMultiReadings(
