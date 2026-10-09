@@ -18,17 +18,38 @@ O início é inclusivo e o fim exclusivo. reading_time deve ser timestamptz;
 se for timestamp sem fuso, os valores são interpretados no fuso indicado.
 Não grava no banco. Senha apenas em memória. Consultas em segundo plano.
 Limite de 500 mil pontos por consulta: reduza o período caso seja excedido.
+
+ANÁLISES (os gráficos originais continuam usando as leituras brutas):
+- Selecione as sondas e o período como antes. Use Comparar pares ou Tendências.
+- Janela: média de CO₂ em intervalos fixos ancorados no início solicitado.
+  Não há interpolação, deslocamento temporal ou preenchimento de lacunas.
+- A → B significa diferença B-A. São geradas todas as combinações, uma vez.
+  O offset é vertical, em ppm, e subtraído de B. Opções: média de B-A
+  (minimiza RMSE após ajuste), primeira diferença comum, ou sem ajuste.
+  A média remove a diferença média no período; não é calibração da sonda.
+- RMSE e MAE medem a diferença residual em ppm (menores = mais próximas).
+  Pearson r mede associação linear; séries constantes têm r indefinido.
+- Tendência: regressão linear sobre médias por janela, com peso igual para
+  cada janela válida, expressa em ppm/h e ppm/dia. Pelo menos 3 janelas.
+  A tolerância em ppm/h define quando a inclinação é considerada pequena.
+  R² é descritivo; não há teste de significância. A inclinação do CO₂ não
+  comprova drift instrumental: também pode refletir mudança real no ambiente.
+  A inclinação da diferença entre sondas mede divergência relativa.
+- Resumos e séries analisadas podem ser exportados em CSV (UTF-8, ';').
 """
 import math
+import csv
+from itertools import combinations
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 try:
     import psycopg
+    import numpy as np
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     import matplotlib.dates as mdates
@@ -36,6 +57,140 @@ except ImportError as exc:
     raise SystemExit("Instale as dependências: pip install 'psycopg[binary]' matplotlib\n" + str(exc))
 
 MAX_POINTS = 500_000
+MAX_ANALYSIS_CELLS = 2_000_000
+OFFSET_MODES = ('Média das diferenças', 'Primeiro ponto comum', 'Sem ajuste')
+
+
+def linear_trend(seconds, values, tolerance=0):
+    """Regressão descritiva por mínimos quadrados, sem inferência estatística."""
+    mask = np.isfinite(values)
+    x = np.asarray(seconds, dtype=float)[mask] / 3600
+    y = np.asarray(values, dtype=float)[mask]
+    if len(y) < 3 or np.ptp(x) == 0:
+        return None
+    xc, yc = x - x.mean(), y - y.mean()
+    slope = float(np.dot(xc, yc) / np.dot(xc, xc))
+    intercept = float(y.mean() - slope*x.mean())
+    fitted = intercept + slope*x
+    total = float(np.dot(yc, yc))
+    r2 = None if total == 0 else float(1 - np.sum((y-fitted)**2)/total)
+    direction = 'positivo' if slope > tolerance else 'negativo' if slope < -tolerance else 'dentro da tolerância'
+    return dict(slope=slope, intercept=intercept, r2=r2, direction=direction,
+                change=float(slope*np.ptp(x)), hours=float(np.ptp(x)), n=len(y))
+
+
+def analyze(data, first, last, step=60, offset_mode=OFFSET_MODES[0], tolerance=0, pairs=True):
+    """Média por janela; diferenças B-A apenas em janelas com dados de ambas.
+
+    Não interpola nem preenche lacunas. A grade começa no início solicitado.
+    Janelas vazias permanecem NaN, inclusive nos gráficos. Tendências usam
+    todas as janelas válidas da respectiva sonda; pares usam apenas as comuns.
+    """
+    if not math.isfinite(step) or step <= 0:
+        raise ValueError('A janela deve ser um número positivo de segundos.')
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError('A tolerância deve ser um número não negativo em ppm/h.')
+    if offset_mode not in OFFSET_MODES:
+        raise ValueError('Modo de offset inválido.')
+    duration = last.timestamp() - first.timestamp()
+    if duration <= 0:
+        raise ValueError('O início deve ser anterior ao fim.')
+    size = math.ceil(duration/step)
+    count = len(data)
+    pair_count = count*(count-1)//2 if pairs else 0
+    if size*(count + 3*pair_count) > MAX_ANALYSIS_CELLS:
+        raise ValueError('Grade de análise muito grande. Aumente a janela, reduza o período ou selecione menos sondas.')
+    # Centros das janelas, inclusive da última janela parcial.
+    seconds = (np.arange(size)*step + np.minimum((np.arange(size)+1)*step, duration))/2
+    dates = [datetime.fromtimestamp(first.timestamp()+float(s), first.tzinfo) for s in seconds]
+    series = {}
+    for sid, (name, timestamps, values) in data.items():
+        elapsed = np.array([t.timestamp()-first.timestamp() for t in timestamps])
+        vals = np.asarray(values, dtype=float)
+        valid = (elapsed >= 0) & (elapsed < duration) & np.isfinite(vals)
+        indices = np.floor(elapsed[valid]/step).astype(int)
+        counts = np.bincount(indices, minlength=size)
+        sums = np.bincount(indices, weights=vals[valid], minlength=size)
+        means = np.full(size, np.nan)
+        np.divide(sums, counts, out=means, where=counts > 0)
+        series[sid] = dict(name=name, values=means, trend=linear_trend(seconds, means, tolerance),
+                           n=int(np.count_nonzero(counts)), raw_n=int(valid.sum()))
+    comparisons = []
+    if pairs:
+        for a, b in combinations(series, 2):
+            av, bv = series[a]['values'], series[b]['values']
+            mask = np.isfinite(av) & np.isfinite(bv)
+            n = int(mask.sum())
+            item = dict(a=a, b=b, label=f"{series[a]['name']} [{a}] → {series[b]['name']} [{b}]", n=n)
+            if n < 3:
+                item['error'] = 'Menos de 3 janelas comuns com dados.'
+                comparisons.append(item)
+                continue
+            raw = bv[mask]-av[mask]
+            offset = float(raw.mean()) if offset_mode == OFFSET_MODES[0] else float(raw[0]) if offset_mode == OFFSET_MODES[1] else 0.0
+            delta = np.full(size, np.nan)
+            delta[mask] = raw-offset
+            residual = delta[mask]
+            correlation = None
+            if np.ptp(av[mask]) > 0 and np.ptp(bv[mask]) > 0:
+                correlation = float(np.corrcoef(av[mask], bv[mask])[0, 1])
+            item.update(offset=offset, delta=delta, correlation=correlation,
+                        rmse=float(np.sqrt(np.mean(residual**2))),
+                        mae=float(np.mean(np.abs(residual))),
+                        raw_mean=float(raw.mean()),
+                        trend=linear_trend(seconds, delta, tolerance))
+            comparisons.append(item)
+    return dict(series=series, pairs=comparisons, dates=dates, seconds=seconds,
+                size=size, step=step, offset_mode=offset_mode, tolerance=tolerance)
+
+
+def fmt(value):
+    return '—' if value is None else f'{value:.4g}'
+
+
+def time_axis(ax, zone, first, last, ylabel):
+    ax.set(xlabel=f'Data e hora — {zone.key}', ylabel=ylabel, xlim=(first, last))
+    ax.grid(True, alpha=0.3)
+    locator = mdates.AutoDateLocator(tz=zone)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator, tz=zone))
+
+
+def analysis_figure(result, key, mode, zone, first, last):
+    """Figura independente de Tk: também permite verificação sem tela."""
+    fig = Figure(figsize=(10, 6), dpi=100, layout='constrained')
+    dates, seconds = result['dates'], result['seconds']
+    if mode == 'similarity':
+        item = result['pairs'][key]
+        upper, lower = fig.subplots(2, 1, sharex=True)
+        a, b = item['a'], item['b']
+        mask = np.isfinite(item['delta'])
+        upper.plot(dates, np.where(mask, result['series'][a]['values'], np.nan), label='A: '+result['series'][a]['name'])
+        upper.plot(dates, np.where(mask, result['series'][b]['values']-item['offset'], np.nan), label='B ajustada: '+result['series'][b]['name'])
+        upper.set_title(item['label'] + f"\nB ajustada = B − ({item['offset']:.4g} ppm)")
+        upper.legend(fontsize=9)
+        time_axis(upper, zone, first, last, 'CO₂ (ppm)')
+        upper.set_xlabel('')
+        lower.plot(dates, item['delta'], label='(B − offset) − A', linewidth=1)
+        lower.axhline(0, color='gray', linewidth=0.8)
+        trend = item['trend']
+        lower.plot(dates, np.where(mask, trend['intercept']+trend['slope']*seconds/3600, np.nan),
+                   '--', label=f"Tendência da diferença: {trend['slope']:+.4g} ppm/h")
+        lower.set_title(f"RMSE={item['rmse']:.4g} ppm | MAE={item['mae']:.4g} ppm | r={fmt(item['correlation'])} | n={item['n']}")
+        lower.legend(fontsize=9)
+        time_axis(lower, zone, first, last, 'Diferença (ppm)')
+    else:
+        item = result['series'][key]
+        ax = fig.add_subplot(111)
+        ax.plot(dates, item['values'], label='Média por janela', linewidth=1)
+        trend = item['trend']
+        fitted = trend['intercept']+trend['slope']*seconds/3600
+        ax.plot(dates, np.where(np.isfinite(item['values']), fitted, np.nan), '--',
+                label=f"Tendência: {trend['slope']:+.4g} ppm/h ({trend['direction']})")
+        ax.set_title(f"{item['name']} [{key}]\nR²={fmt(trend['r2'])} | variação ajustada={trend['change']:+.4g} ppm | n={trend['n']}")
+        ax.legend(fontsize=9)
+        time_axis(ax, zone, first, last, 'CO₂ (ppm)')
+    return fig
 
 
 def parse_period(start, end, timezone):
@@ -96,8 +251,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Estufas — gráficos de CO₂')
-        self.geometry('850x680')
-        self.minsize(730, 620)
+        self.geometry('920x850')
+        self.minsize(850, 790)
         self.events = queue.Queue()
         self.sensors = []
         self.busy = False
@@ -106,7 +261,7 @@ class App(tk.Tk):
         conn.pack(fill='x', padx=12, pady=12)
         for i, (key, label, default) in enumerate([
             ('host', 'Servidor', 'localhost'), ('port', 'Porta', '5432'),
-            ('dbname', 'Banco', 'painel_de_dados_db'), ('user', 'Usuário', 'painel-de-dados'),
+            ('dbname', 'Banco', 'painel_de_dados_db'), ('user', 'Usuário', 'grafana'),
             ('password', 'Senha', ''), ('timezone', 'Fuso horário', 'America/Sao_Paulo')
         ]):
             row, col = divmod(i, 2)
@@ -139,12 +294,27 @@ class App(tk.Tk):
         for col, (label, var) in enumerate([('Início', self.start), ('Fim', self.end)]):
             ttk.Label(period, text=label).grid(row=0, column=col*2, padx=5)
             ttk.Entry(period, textvariable=var, width=25).grid(row=0, column=col*2+1, padx=5)
+        options = ttk.LabelFrame(self, text='Opções para similaridade e tendência', padding=8)
+        options.pack(fill='x', padx=12, pady=6)
+        self.step = tk.StringVar(value='60')
+        self.offset_mode = tk.StringVar(value=OFFSET_MODES[0])
+        self.tolerance = tk.StringVar(value='0')
+        ttk.Label(options, text='Janela (segundos)').grid(row=0, column=0, padx=5)
+        ttk.Entry(options, textvariable=self.step, width=10).grid(row=0, column=1, padx=5)
+        ttk.Label(options, text='Offset vertical').grid(row=0, column=2, padx=5)
+        ttk.Combobox(options, textvariable=self.offset_mode, values=OFFSET_MODES,
+                     state='readonly', width=24).grid(row=0, column=3, padx=5)
+        ttk.Label(options, text='Tolerância (ppm/h)').grid(row=1, column=0, padx=5, pady=6)
+        ttk.Entry(options, textvariable=self.tolerance, width=10).grid(row=1, column=1, padx=5)
+        ttk.Label(options, text='Médias por janela; sem preencher lacunas.').grid(row=1, column=2, columnspan=2)
+        ttk.Button(options, text='Como interpretar', command=self.show_help).grid(row=0, column=4, rowspan=2, padx=8)
         buttons = ttk.Frame(self)
         buttons.pack(pady=8)
         self.plot_buttons = []
-        for text, mode in [('Gráfico superposto', 'overlay'), ('Gráficos isolados', 'individual')]:
+        for i, (text, mode) in enumerate([('Gráfico superposto', 'overlay'), ('Gráficos isolados', 'individual'),
+                                         ('Comparar pares', 'similarity'), ('Tendências', 'trend')]):
             button = ttk.Button(buttons, text=text, command=lambda m=mode: self.fetch_plot(m))
-            button.pack(side='left', padx=8)
+            button.grid(row=i//2, column=i%2, padx=8, pady=4, sticky='ew')
             self.plot_buttons.append(button)
         self.status = tk.StringVar(value='Configure a conexão e carregue as sondas.')
         ttk.Label(self, textvariable=self.status, wraplength=800).pack(fill='x', padx=16, pady=8)
@@ -212,14 +382,163 @@ class App(tk.Tk):
         if not selected:
             messagebox.showinfo('Seleção', 'Selecione ao menos uma sonda.', parent=self)
             return
+        if mode == 'similarity' and len(selected) < 2:
+            messagebox.showinfo('Seleção', 'Selecione ao menos duas sondas para comparar.', parent=self)
+            return
         try:
             params, timezone = self.settings()
             first, last, zone = parse_period(self.start.get(), self.end.get(), timezone)
+            if mode in ('similarity', 'trend'):
+                step = float(self.step.get().replace(',', '.'))
+                tolerance = float(self.tolerance.get().replace(',', '.'))
+                offset_mode = self.offset_mode.get()
+                if not math.isfinite(step) or step <= 0 or not math.isfinite(tolerance) or tolerance < 0:
+                    raise ValueError('Janela deve ser positiva e tolerância não negativa; ambos devem ser finitos.')
         except Exception as exc:
             messagebox.showerror('Dados inválidos', str(exc), parent=self)
             return
-        self.run_job(lambda: load_readings(params, timezone, selected, first, last),
-                     lambda result: self.show_plots(result, mode, zone, first, last))
+        if mode in ('similarity', 'trend'):
+            def work():
+                data, skipped = load_readings(params, timezone, selected, first, last)
+                return analyze(data, first, last, step, offset_mode, tolerance, pairs=mode == 'similarity'), skipped
+            self.run_job(work, lambda result: self.show_analysis(result, mode, zone, first, last))
+        else:
+            self.run_job(lambda: load_readings(params, timezone, selected, first, last),
+                         lambda result: self.show_plots(result, mode, zone, first, last))
+
+    def show_help(self):
+        messagebox.showinfo('Como interpretar',
+            'A → B: diferença (B − offset) − A, em ppm. Offset é vertical, não temporal.\n\n'
+            'Média das diferenças: subtrai de B a média de B−A nas janelas comuns. '
+            'Primeiro ponto comum: usa apenas a primeira janela comum (mais sensível a ruído). '
+            'Sem ajuste: preserva a diferença original.\n\n'
+            'RMSE/MAE menores indicam curvas mais próximas. Pearson r próximo de +1 indica '
+            'variação conjunta, mas não garante igualdade de valores.\n\n'
+            'Inclinação positiva = subida; negativa = descida. A tolerância, em ppm/h, '
+            'define uma faixa em torno de zero. R² indica quanto a reta explica a variação. '
+            'São estimativas descritivas, sem teste de significância.\n\n'
+            'A tendência de uma sonda pode refletir mudanças ambientais. A tendência da '
+            'diferença indica divergência relativa; sozinha não identifica qual sonda tem drift.\n\n'
+            'Janelas vazias não são preenchidas. Cada tendência usa o período efetivamente '
+            'coberto pela sonda; pares usam apenas as janelas comuns. A variação ajustada '
+            'se refere do primeiro ao último ponto válido. Alterar a janela pode alterar os resultados.', parent=self)
+
+    def show_analysis(self, payload, mode, zone, first, last):
+        result, skipped = payload
+        self.status.set(f"Análise concluída: janela de {result['step']:g} s; {skipped} valores não finitos ignorados.")
+        window = tk.Toplevel(self)
+        window.title('CO₂ — ' + ('similaridade entre pares' if mode == 'similarity' else 'tendências'))
+        window.geometry('1200x820')
+        note = f"{first:%d/%m/%Y %H:%M:%S} a {last:%d/%m/%Y %H:%M:%S} (fim exclusivo) — {zone.key}\n"
+        note += f"Janela={result['step']:g} s | Offset={result['offset_mode']} | Tolerância={result['tolerance']:g} ppm/h"
+        ttk.Label(window, text=note, padding=8).pack(fill='x')
+        notebook = ttk.Notebook(window)
+        notebook.pack(fill='both', expand=True)
+        summary = ttk.Frame(notebook, padding=8)
+        notebook.add(summary, text='Resumo')
+        if mode == 'similarity':
+            headers = ['Par A → B', 'Janelas comuns', 'Cobertura (%)', 'Offset (ppm)', 'Média B-A (ppm)',
+                       'RMSE (ppm)', 'MAE (ppm)', 'Pearson r', 'Diferença (ppm/h)', 'R² diferença', 'Direção', 'Observação']
+            rows, plots = [], []
+            for i, item in enumerate(result['pairs']):
+                if 'error' in item:
+                    rows.append([item['label'], item['n'], fmt(100*item['n']/result['size']), *(['—']*8), item['error']])
+                else:
+                    trend = item['trend']
+                    rows.append([item['label'], item['n'], fmt(100*item['n']/result['size']), fmt(item['offset']), fmt(item['raw_mean']),
+                                 fmt(item['rmse']), fmt(item['mae']), fmt(item['correlation']), fmt(trend['slope']),
+                                 fmt(trend['r2']), trend['direction'], ''])
+                    plots.append((i, item['label']))
+            explanation = 'Diferença = (B − offset) − A. RMSE/MAE após ajuste. Cobertura: janelas comuns / janelas do período.\nInclinação da diferença: divergência relativa. Correlação indefinida para séries constantes.'
+        else:
+            headers = ['Sonda', 'Leituras', 'Janelas válidas', 'Cobertura (%)', 'Horas cobertas',
+                       'ppm/h', 'ppm/dia', 'Variação ajustada (ppm)', 'R²', 'Direção', 'Observação']
+            rows, plots = [], []
+            for sid, item in result['series'].items():
+                trend = item['trend']
+                label = f"{item['name']} [{sid}]"
+                if trend is None:
+                    rows.append([label, item['raw_n'], item['n'], fmt(100*item['n']/result['size']), *(['—']*6), 'Menos de 3 janelas válidas.'])
+                else:
+                    rows.append([label, item['raw_n'], item['n'], fmt(100*item['n']/result['size']), fmt(trend['hours']),
+                                 fmt(trend['slope']), fmt(trend['slope']*24), fmt(trend['change']), fmt(trend['r2']), trend['direction'], ''])
+                    plots.append((sid, label))
+            explanation = 'Regressão linear das médias por janela; cada janela tem peso igual. Cobertura: janelas válidas / total.\nTendência descritiva do CO₂: não comprova drift instrumental. ppm/dia = ppm/h × 24; não é previsão.'
+        ttk.Label(summary, text=explanation, wraplength=1100).pack(fill='x', pady=8)
+        table_frame = ttk.Frame(summary)
+        table_frame.pack(fill='both', expand=True)
+        columns = [str(i) for i in range(len(headers))]
+        table = ttk.Treeview(table_frame, columns=columns, show='headings')
+        ys = ttk.Scrollbar(table_frame, orient='vertical', command=table.yview)
+        xs = ttk.Scrollbar(table_frame, orient='horizontal', command=table.xview)
+        table.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        table.grid(row=0, column=0, sticky='nsew')
+        ys.grid(row=0, column=1, sticky='ns')
+        xs.grid(row=1, column=0, sticky='ew')
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        for i, header in enumerate(headers):
+            table.heading(str(i), text=header)
+            table.column(str(i), width=270 if i == 0 else 140, stretch=False)
+        for row in rows:
+            table.insert('', 'end', values=row)
+        actions = ttk.Frame(summary)
+        actions.pack(fill='x', pady=8)
+        ttk.Button(actions, text='Exportar resumo CSV', command=lambda: self.export_summary(headers, rows, result, first, last, zone)).pack(side='left', padx=5)
+        ttk.Button(actions, text='Exportar séries CSV', command=lambda: self.export_series(result, first, last, zone)).pack(side='left', padx=5)
+        # Figuras criadas apenas ao abrir cada aba, para evitar travar com muitos pares.
+        pending = {}
+        for key, label in plots:
+            frame = ttk.Frame(notebook)
+            notebook.add(frame, text=label)
+            pending[str(frame)] = (frame, key)
+        def open_tab(event):
+            entry = pending.pop(notebook.select(), None)
+            if entry:
+                frame, key = entry
+                try:
+                    fig = analysis_figure(result, key, mode, zone, first, last)
+                    self.embed_figure(frame, fig)
+                except Exception as exc:
+                    pending[str(frame)] = entry
+                    messagebox.showerror('Erro no gráfico', str(exc), parent=window)
+        notebook.bind('<<NotebookTabChanged>>', open_tab)
+
+    def export_summary(self, headers, rows, result, first, last, zone):
+        path = filedialog.asksaveasfilename(parent=self, defaultextension='.csv', initialfile='resumo_co2.csv', filetypes=[('CSV', '*.csv')])
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8-sig', newline='') as output:
+                writer = csv.writer(output, delimiter=';')
+                writer.writerow(['Inicio', first.isoformat(), 'Fim_exclusivo', last.isoformat(), 'Fuso', zone.key])
+                writer.writerow(['Janela_segundos', result['step'], 'Offset', result['offset_mode'], 'Tolerancia_ppm_h', result['tolerance']])
+                writer.writerow(headers)
+                writer.writerows(rows)
+            messagebox.showinfo('Exportação', 'Resumo salvo.', parent=self)
+        except OSError as exc:
+            messagebox.showerror('Exportação', str(exc), parent=self)
+
+    def export_series(self, result, first, last, zone):
+        path = filedialog.asksaveasfilename(parent=self, defaultextension='.csv', initialfile='series_co2.csv', filetypes=[('CSV', '*.csv')])
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8-sig', newline='') as output:
+                writer = csv.writer(output, delimiter=';')
+                writer.writerow(['Inicio', first.isoformat(), 'Fim_exclusivo', last.isoformat(), 'Fuso', zone.key])
+                writer.writerow(['Janela_segundos', result['step'], 'Offset', result['offset_mode'], 'Tolerancia_ppm_h', result['tolerance']])
+                series = list(result['series'].items())
+                pairs = [item for item in result['pairs'] if 'error' not in item]
+                writer.writerow(['Offsets_ppm'] + [f"{item['label']}: {item['offset']:.12g}" for item in pairs])
+                writer.writerow(['Centro_janela'] + [f"{item['name']} [{sid}] media_ppm" for sid, item in series]
+                                + [f"{item['label']} diferenca_ajustada_ppm" for item in pairs])
+                for i, date in enumerate(result['dates']):
+                    values = [item['values'][i] for _, item in series] + [item['delta'][i] for item in pairs]
+                    writer.writerow([date.isoformat()] + [float(value) if np.isfinite(value) else '' for value in values])
+            messagebox.showinfo('Exportação', 'Séries salvas. Campos vazios indicam ausência de dados.', parent=self)
+        except OSError as exc:
+            messagebox.showerror('Exportação', str(exc), parent=self)
 
     def show_plots(self, result, mode, zone, first, last):
         data, skipped = result
@@ -256,6 +575,9 @@ class App(tk.Tk):
         locator = mdates.AutoDateLocator(tz=zone)
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator, tz=zone))
+        self.embed_figure(parent, fig)
+
+    def embed_figure(self, parent, fig):
         canvas = FigureCanvasTkAgg(fig, master=parent)
         toolbar = NavigationToolbar2Tk(canvas, parent, pack_toolbar=False)
         toolbar.update()
