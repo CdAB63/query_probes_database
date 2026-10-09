@@ -1,3 +1,4 @@
 psycopg
 streamlit
 pandas
+matplotlib
