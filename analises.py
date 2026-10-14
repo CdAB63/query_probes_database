@@ -37,6 +37,15 @@ ANÁLISES (os gráficos originais continuam usando as leituras brutas):
   R² é descritivo; não há teste de significância. A inclinação do parâmetro não
   comprova drift instrumental: também pode refletir mudança real no ambiente.
   A inclinação da diferença entre sondas mede divergência relativa.
+- Correlação móvel: selecione exatamente duas sondas e use o novo botão.
+  Duração padrão 15 min, avanço 1 min, base de alinhamento 60 s.
+  Médias na mesma célula formam pares; exige por padrão 5 pares e 80% de
+  cobertura. Usa somente janelas completas [início, fim), com resultado
+  no centro temporal. Duração e avanço são múltiplos da base.
+  Pearson constante/sem variação suficiente é indefinido, nunca zero.
+  RMSE complementar remove o offset médio local, mas preserva diferenças
+  de amplitude. Nenhuma correção de atraso temporal é aplicada.
+  Janelas sobrepostas não são observações independentes; análise descritiva.
 - Resumos e séries analisadas podem ser exportados em CSV (UTF-8, ';').
 """
 import math
@@ -159,6 +168,134 @@ def analyze(data, first, last, step=60, offset_mode=OFFSET_MODES[0], tolerance=0
             comparisons.append(item)
     return dict(series=series, pairs=comparisons, dates=dates, seconds=seconds,
                 size=size, step=step, offset_mode=offset_mode, tolerance=tolerance, parameter=parameter)
+
+
+def rolling_settings(first, last, base, window, advance, min_points, coverage, min_std):
+    """Durações em segundos. Janelas completas, alinhadas à grade comum."""
+    if any(not math.isfinite(x) or x <= 0 for x in (base, window, advance)):
+        raise ValueError('Base, duração e avanço devem ser positivos e finitos.')
+    if not math.isfinite(coverage) or not 0 <= coverage <= 100:
+        raise ValueError('Cobertura deve estar entre 0 e 100%.')
+    if not math.isfinite(min_std) or min_std < 0:
+        raise ValueError('Desvio mínimo deve ser não negativo e finito.')
+    if not isinstance(min_points, int) or min_points < 3:
+        raise ValueError('Use ao menos 3 pontos comuns por janela.')
+    ratios = (window/base, advance/base)
+    if any(not math.isfinite(x) or x > MAX_ANALYSIS_CELLS for x in ratios):
+        raise ValueError('Duração ou avanço muito grande em relação à base.')
+    if any(not math.isclose(x, round(x), rel_tol=0, abs_tol=1e-8) for x in ratios):
+        raise ValueError('Duração e avanço devem ser múltiplos da base de alinhamento.')
+    width, hop = (int(round(x)) for x in ratios)
+    if width < min_points or hop < 1:
+        raise ValueError('Diminua a base ou aumente a duração: faltam pontos por janela.')
+    duration = last.timestamp()-first.timestamp()
+    if duration < window:
+        raise ValueError('O período selecionado deve conter ao menos uma janela completa.')
+    count = math.floor((duration-window)/advance + 1e-10)+1
+    if count > 100_000 or count*width > 50_000_000:
+        raise ValueError('Análise muito grande. Aumente o avanço/base ou reduza o período.')
+    return width, hop, count
+
+
+def rolling_correlation(data, first, last, parameter='co2_ppm', base=60,
+                        window=900, advance=60, min_points=5, coverage=80, min_std=0):
+    """Pearson local e RMSE após remover média de B-A; não preenche lacunas.
+
+    Cada ponto é média de uma célula da grade. Só pares válidos na mesma
+    célula entram nas métricas. O centro corresponde à janela solicitada,
+    mesmo quando existem lacunas internas. Limites [início, fim).
+    """
+    if len(data) != 2:
+        raise ValueError('Selecione exatamente duas sondas para a correlação móvel.')
+    width, hop, count = rolling_settings(first, last, base, window, advance,
+                                       min_points, coverage, min_std)
+    aligned = analyze(data, first, last, base, pairs=False, parameter=parameter)
+    ids = list(aligned['series'])
+    aa, bb = (aligned['series'][sid]['values'] for sid in ids)
+    records = []
+    for index in range(count):
+        lo = index*hop
+        av, bv = aa[lo:lo+width], bb[lo:lo+width]
+        valid = np.isfinite(av) & np.isfinite(bv)
+        x, y = av[valid], bv[valid]
+        n = len(x)
+        covered = 100*n/width
+        start = first.timestamp()+index*advance
+        record = dict(start=datetime.fromtimestamp(start, first.tzinfo),
+                      end=datetime.fromtimestamp(start+window, first.tzinfo),
+                      center=datetime.fromtimestamp(start+window/2, first.tzinfo),
+                      n=n, coverage=covered, r=float('nan'), rmse=float('nan'),
+                      offset=float('nan'), std_a=float('nan'), std_b=float('nan'))
+        if n < min_points or covered+1e-10 < coverage:
+            record['status'] = 'Dados insuficientes'
+        else:
+            xc, yc = x-x.mean(), y-y.mean()
+            sx, sy = float(np.sqrt(np.mean(xc**2))), float(np.sqrt(np.mean(yc**2)))
+            diff = y-x
+            offset = float(diff.mean())
+            record.update(offset=offset, rmse=float(np.sqrt(np.mean((diff-offset)**2))),
+                          std_a=sx, std_b=sy)
+            # Além do limiar escolhido, detecta variações na escala do erro numérico.
+            eps = np.finfo(float).eps*32
+            threshold_a = max(min_std, eps*float(np.max(np.abs(x))))
+            threshold_b = max(min_std, eps*float(np.max(np.abs(y))))
+            if sx <= threshold_a or sy <= threshold_b:
+                record['status'] = 'Variação insuficiente para Pearson'
+            else:
+                record['r'] = float(np.clip(np.mean((xc/sx)*(yc/sy)), -1, 1))
+                record['status'] = 'OK'
+        records.append(record)
+    return dict(parameter=parameter, aligned=aligned, ids=ids, records=records,
+                first=first, last=last, base=base, window=window, advance=advance,
+                min_points=min_points, coverage=coverage, min_std=min_std)
+
+
+def rolling_figure(result, zone):
+    info = parameter_info(result['parameter'])
+    aligned, records = result['aligned'], result['records']
+    dates = [r['center'] for r in records]
+    fig = Figure(figsize=(11, 8), dpi=100, layout='constrained')
+    axes = fig.subplots(4, 1, sharex=True, gridspec_kw={'height_ratios': [1.4, 1.3, 1, .65]})
+    for sid in result['ids']:
+        item = aligned['series'][sid]
+        axes[0].plot(aligned['dates'], item['values'], label=f"{item['name']} [{sid}]", linewidth=1)
+    axes[0].set_title(f"{info['label']} — correlação móvel: {result['window']/60:g} min, avanço {result['advance']/60:g} min")
+    axes[0].legend(fontsize=8)
+    axes[1].plot(dates, [r['r'] for r in records], '.-', markersize=3, label='Pearson r')
+    axes[1].axhline(0, color='gray', linewidth=.7)
+    axes[1].set_ylim(-1.05, 1.05)
+    axes[2].plot(dates, [r['rmse'] for r in records], '.-', markersize=3, color='tab:orange')
+    axes[3].plot(dates, [r['coverage'] for r in records], linewidth=1, color='tab:green')
+    axes[3].axhline(result['coverage'], color='gray', linestyle='--', linewidth=.8)
+    axes[3].set_ylim(-2, 102)
+    labels = [f"{info['label']} ({info['unit']})", 'Pearson r',
+              f"RMSE sem offset\n({info['delta_unit']})", 'Cobertura (%)']
+    for ax, label in zip(axes, labels):
+        time_axis(ax, zone, result['first'], result['last'], label)
+        ax.tick_params(axis='both', labelsize=8)
+        ax.yaxis.label.set_size(9)
+        ax.set_xlabel('')
+    axes[-1].set_xlabel(f'Data e hora — centro da janela — {zone.key}')
+    return fig
+
+
+def write_rolling_csv(path, result):
+    info = parameter_info(result['parameter'])
+    with open(path, 'w', encoding='utf-8-sig', newline='') as output:
+        writer = csv.writer(output, delimiter=';')
+        writer.writerow(['Parametro', result['parameter'], 'Unidade', info['unit'], 'Unidade_diferenca', info['delta_unit']])
+        writer.writerow(['Inicio', result['first'].isoformat(), 'Fim_exclusivo', result['last'].isoformat()])
+        writer.writerow(['Sonda_A', result['ids'][0], result['aligned']['series'][result['ids'][0]]['name'],
+                         'Sonda_B', result['ids'][1], result['aligned']['series'][result['ids'][1]]['name']])
+        writer.writerow(['Base_s', result['base'], 'Janela_s', result['window'], 'Avanco_s', result['advance'],
+                         'Min_pontos', result['min_points'], 'Cobertura_min_pct', result['coverage'], 'Desvio_min', result['min_std']])
+        writer.writerow(['Inicio_janela', 'Fim_exclusivo_janela', 'Centro_janela', 'N_pares', 'Cobertura_pct',
+                         'Pearson_r', f"RMSE_sem_offset_{info['delta_unit']}", f"Offset_medio_B-A_{info['delta_unit']}",
+                         f"Desvio_A_{info['delta_unit']}", f"Desvio_B_{info['delta_unit']}", 'Status'])
+        for row in result['records']:
+            metrics = [row[key] for key in ('r', 'rmse', 'offset', 'std_a', 'std_b')]
+            writer.writerow([row['start'].isoformat(), row['end'].isoformat(), row['center'].isoformat(), row['n'], row['coverage']]
+                            + [value if np.isfinite(value) else '' for value in metrics] + [row['status']])
 
 
 def fmt(value):
@@ -339,8 +476,9 @@ class App(tk.Tk):
         buttons.pack(pady=8)
         self.plot_buttons = []
         for i, (text, mode) in enumerate([('Gráfico superposto', 'overlay'), ('Gráficos isolados', 'individual'),
-                                         ('Comparar pares', 'similarity'), ('Tendências', 'trend')]):
-            button = ttk.Button(buttons, text=text, command=lambda m=mode: self.fetch_plot(m))
+                                         ('Comparar pares', 'similarity'), ('Tendências', 'trend'),
+                                         ('Correlação móvel', 'rolling')]):
+            button = ttk.Button(buttons, text=text, command=lambda m=mode: self.rolling_dialog() if m == 'rolling' else self.fetch_plot(m))
             button.grid(row=i//2, column=i%2, padx=8, pady=4, sticky='ew')
             self.plot_buttons.append(button)
         self.status = tk.StringVar(value='Configure a conexão e carregue as sondas.')
@@ -442,6 +580,95 @@ class App(tk.Tk):
         else:
             self.run_job(lambda: load_readings(params, timezone, selected, first, last, parameter),
                          lambda result: self.show_plots(result, mode, zone, first, last, parameter))
+
+    def rolling_dialog(self):
+        selected = [self.sensors[i] for i in self.listbox.curselection()]
+        if len(selected) != 2:
+            messagebox.showinfo('Seleção', 'Selecione exatamente duas sondas para a correlação móvel.', parent=self)
+            return
+        try:
+            params, timezone = self.settings()
+            first, last, zone = parse_period(self.start.get(), self.end.get(), timezone)
+            parameter = self.selected_parameter()
+        except Exception as exc:
+            messagebox.showerror('Dados inválidos', str(exc), parent=self)
+            return
+        info = parameter_info(parameter)
+        dialog = tk.Toplevel(self)
+        dialog.title('Configurar correlação móvel')
+        dialog.transient(self)
+        dialog.grab_set()
+        frame = ttk.Frame(dialog, padding=15)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text=f"{selected[0][1]} × {selected[1][1]} — {info['label']}").grid(row=0, column=0, columnspan=2, sticky='w', pady=6)
+        values = {}
+        fields = [('window', 'Duração da janela (min)', '15'),
+                  ('advance', 'Avanço (min)', '1'),
+                  ('base', 'Base de alinhamento (segundos)', '60'),
+                  ('min_points', 'Mínimo de pontos comuns', '5'),
+                  ('coverage', 'Cobertura mínima (%)', '80'),
+                  ('min_std', f"Desvio padrão mínimo ({info['delta_unit']})", '0')]
+        for row, (key, label, default) in enumerate(fields, 1):
+            values[key] = tk.StringVar(value=default)
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', padx=4, pady=4)
+            ttk.Entry(frame, textvariable=values[key], width=12).grid(row=row, column=1, padx=6, pady=4)
+        ttk.Label(frame, wraplength=550, text=(
+            'A base define médias em uma grade comum, sem preencher lacunas. Duração e avanço '
+            'devem ser múltiplos da base. Só janelas completas entram na análise.\n\n'
+            'Pearson: +1 = variação conjunta, 0 = pouca associação linear, −1 = variação oposta. '
+            'Séries constantes ou com poucos dados ficam sem correlação. O desvio mínimo permite '
+            'ignorar trechos quase planos dominados por ruído.\n\n'
+            'O gráfico inclui RMSE após retirar o offset médio de cada janela e a cobertura de dados. '
+            'Pearson não mede topologia: mudanças de forma, amplitude e atrasos podem afetar as métricas. '
+            'Os controles de offset/tolerância da tela principal não se aplicam a esta operação.'
+        )).grid(row=7, column=0, columnspan=2, pady=10)
+        def execute():
+            try:
+                settings = {key: float(var.get().replace(',', '.')) for key, var in values.items() if key != 'min_points'}
+                settings['min_points'] = int(values['min_points'].get())
+                settings['window'] *= 60
+                settings['advance'] *= 60
+                rolling_settings(first, last, **settings)
+            except Exception as exc:
+                messagebox.showerror('Configuração inválida', str(exc), parent=dialog)
+                return
+            dialog.destroy()
+            def work():
+                data, skipped = load_readings(params, timezone, selected, first, last, parameter)
+                return rolling_correlation(data, first, last, parameter, **settings), skipped
+            self.run_job(work, lambda payload: self.show_rolling(payload, zone))
+        ttk.Button(frame, text='Calcular e plotar', command=execute).grid(row=8, column=0, pady=5)
+        ttk.Button(frame, text='Cancelar', command=dialog.destroy).grid(row=8, column=1, pady=5)
+
+    def show_rolling(self, payload, zone):
+        result, skipped = payload
+        records = result['records']
+        valid = sum(np.isfinite(r['r']) for r in records)
+        window = tk.Toplevel(self)
+        window.title(parameter_info(result['parameter'])['label'] + ' — correlação móvel')
+        window.geometry('1150x900')
+        note = (f"{valid}/{len(records)} janelas com Pearson válido | base={result['base']:g} s | "
+                f"mínimo={result['min_points']} pontos e {result['coverage']:g}% de cobertura\n"
+                'Lacunas = dados ou variação insuficientes; não equivalem a r=0. '
+                'Pearson ignora offset e escala; RMSE sem offset complementa a comparação de amplitude.')
+        ttk.Label(window, text=note, wraplength=1100, padding=8).pack(fill='x')
+        ttk.Button(window, text='Exportar correlação móvel CSV',
+                   command=lambda: self.export_rolling(result)).pack(pady=4)
+        graph = ttk.Frame(window)
+        graph.pack(fill='both', expand=True)
+        self.embed_figure(graph, rolling_figure(result, zone))
+        self.status.set(f'Correlação móvel: {valid}/{len(records)} janelas válidas; {skipped} valores não finitos ignorados.')
+
+    def export_rolling(self, result):
+        path = filedialog.asksaveasfilename(parent=self, defaultextension='.csv',
+            initialfile=f"correlacao_movel_{result['parameter']}.csv", filetypes=[('CSV', '*.csv')])
+        if not path:
+            return
+        try:
+            write_rolling_csv(path, result)
+            messagebox.showinfo('Exportação', 'Correlação móvel salva. Valores indefinidos ficam vazios.', parent=self)
+        except OSError as exc:
+            messagebox.showerror('Exportação', str(exc), parent=self)
 
     def show_help(self):
         messagebox.showinfo('Como interpretar',
