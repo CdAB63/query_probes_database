@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gráficos de CO₂ para sondas Estufa — Python 3.10+.
+"""Gráficos de CO₂, temperatura e umidade para sondas Estufa — Python 3.10+.
 
 Instalação Ubuntu/Kubuntu:
   sudo apt install python3-tk python3-venv
@@ -12,7 +12,7 @@ Informe a conexão e clique em Carregar sondas. Marque por clique as sondas
 A barra de ferramentas de cada gráfico permite zoom e salvar PNG/PDF/SVG.
 
 Esquema esperado: public.sensor(id, sensor_name),
-public.sensor_reading(sensor_id, co2_ppm, reading_time).
+public.sensor_reading(sensor_id, co2_ppm, temperature_c, humidity_percent, reading_time).
 Datas: DD/MM/AAAA HH:MM:SS, interpretadas no fuso indicado.
 O início é inclusivo e o fim exclusivo. reading_time deve ser timestamptz;
 se for timestamp sem fuso, os valores são interpretados no fuso indicado.
@@ -21,18 +21,20 @@ Limite de 500 mil pontos por consulta: reduza o período caso seja excedido.
 
 ANÁLISES (os gráficos originais continuam usando as leituras brutas):
 - Selecione as sondas e o período como antes. Use Comparar pares ou Tendências.
-- Janela: média de CO₂ em intervalos fixos ancorados no início solicitado.
+- Escolha CO₂, Temperatura ou Umidade no seletor. Usuário padrão: grafana.
+- Unidades: ppm, °C e %; diferenças de umidade em pontos percentuais (p.p.).
+- Janela: média do parâmetro selecionado em intervalos fixos ancorados no início solicitado.
   Não há interpolação, deslocamento temporal ou preenchimento de lacunas.
 - A → B significa diferença B-A. São geradas todas as combinações, uma vez.
-  O offset é vertical, em ppm, e subtraído de B. Opções: média de B-A
+  O offset é vertical, na unidade de diferença do parâmetro, e subtraído de B. Opções: média de B-A
   (minimiza RMSE após ajuste), primeira diferença comum, ou sem ajuste.
   A média remove a diferença média no período; não é calibração da sonda.
-- RMSE e MAE medem a diferença residual em ppm (menores = mais próximas).
+- RMSE e MAE medem a diferença residual na unidade do parâmetro (menores = mais próximas).
   Pearson r mede associação linear; séries constantes têm r indefinido.
 - Tendência: regressão linear sobre médias por janela, com peso igual para
-  cada janela válida, expressa em ppm/h e ppm/dia. Pelo menos 3 janelas.
-  A tolerância em ppm/h define quando a inclinação é considerada pequena.
-  R² é descritivo; não há teste de significância. A inclinação do CO₂ não
+  cada janela válida, expressa em unidades/h e unidades/dia. Pelo menos 3 janelas.
+  A tolerância em unidades/h define quando a inclinação é considerada pequena.
+  R² é descritivo; não há teste de significância. A inclinação do parâmetro não
   comprova drift instrumental: também pode refletir mudança real no ambiente.
   A inclinação da diferença entre sondas mede divergência relativa.
 - Resumos e séries analisadas podem ser exportados em CSV (UTF-8, ';').
@@ -61,6 +63,20 @@ MAX_ANALYSIS_CELLS = 2_000_000
 OFFSET_MODES = ('Média das diferenças', 'Primeiro ponto comum', 'Sem ajuste')
 
 
+PARAMETERS = {
+    'co2_ppm': dict(label='CO₂', unit='ppm', delta_unit='ppm'),
+    'temperature_c': dict(label='Temperatura', unit='°C', delta_unit='°C'),
+    'humidity_percent': dict(label='Umidade', unit='%', delta_unit='p.p.'),
+}
+
+
+def parameter_info(parameter):
+    # Whitelist: nenhum nome de coluna fornecido livremente entra na consulta SQL.
+    if parameter not in PARAMETERS:
+        raise ValueError('Parâmetro inválido.')
+    return PARAMETERS[parameter]
+
+
 def linear_trend(seconds, values, tolerance=0):
     """Regressão descritiva por mínimos quadrados, sem inferência estatística."""
     mask = np.isfinite(values)
@@ -79,17 +95,18 @@ def linear_trend(seconds, values, tolerance=0):
                 change=float(slope*np.ptp(x)), hours=float(np.ptp(x)), n=len(y))
 
 
-def analyze(data, first, last, step=60, offset_mode=OFFSET_MODES[0], tolerance=0, pairs=True):
+def analyze(data, first, last, step=60, offset_mode=OFFSET_MODES[0], tolerance=0, pairs=True, parameter='co2_ppm'):
     """Média por janela; diferenças B-A apenas em janelas com dados de ambas.
 
     Não interpola nem preenche lacunas. A grade começa no início solicitado.
     Janelas vazias permanecem NaN, inclusive nos gráficos. Tendências usam
     todas as janelas válidas da respectiva sonda; pares usam apenas as comuns.
     """
+    parameter_info(parameter)
     if not math.isfinite(step) or step <= 0:
         raise ValueError('A janela deve ser um número positivo de segundos.')
     if not math.isfinite(tolerance) or tolerance < 0:
-        raise ValueError('A tolerância deve ser um número não negativo em ppm/h.')
+        raise ValueError('A tolerância deve ser um número não negativo na unidade do parâmetro por hora.')
     if offset_mode not in OFFSET_MODES:
         raise ValueError('Modo de offset inválido.')
     duration = last.timestamp() - first.timestamp()
@@ -141,7 +158,7 @@ def analyze(data, first, last, step=60, offset_mode=OFFSET_MODES[0], tolerance=0
                         trend=linear_trend(seconds, delta, tolerance))
             comparisons.append(item)
     return dict(series=series, pairs=comparisons, dates=dates, seconds=seconds,
-                size=size, step=step, offset_mode=offset_mode, tolerance=tolerance)
+                size=size, step=step, offset_mode=offset_mode, tolerance=tolerance, parameter=parameter)
 
 
 def fmt(value):
@@ -159,6 +176,8 @@ def time_axis(ax, zone, first, last, ylabel):
 def analysis_figure(result, key, mode, zone, first, last):
     """Figura independente de Tk: também permite verificação sem tela."""
     fig = Figure(figsize=(10, 6), dpi=100, layout='constrained')
+    info = parameter_info(result['parameter'])
+    unit, du = info['unit'], info['delta_unit']
     dates, seconds = result['dates'], result['seconds']
     if mode == 'similarity':
         item = result['pairs'][key]
@@ -167,18 +186,18 @@ def analysis_figure(result, key, mode, zone, first, last):
         mask = np.isfinite(item['delta'])
         upper.plot(dates, np.where(mask, result['series'][a]['values'], np.nan), label='A: '+result['series'][a]['name'])
         upper.plot(dates, np.where(mask, result['series'][b]['values']-item['offset'], np.nan), label='B ajustada: '+result['series'][b]['name'])
-        upper.set_title(item['label'] + f"\nB ajustada = B − ({item['offset']:.4g} ppm)")
+        upper.set_title(item['label'] + f"\nB ajustada = B − ({item['offset']:.4g} {du})")
         upper.legend(fontsize=9)
-        time_axis(upper, zone, first, last, 'CO₂ (ppm)')
+        time_axis(upper, zone, first, last, f"{info['label']} ({unit})")
         upper.set_xlabel('')
         lower.plot(dates, item['delta'], label='(B − offset) − A', linewidth=1)
         lower.axhline(0, color='gray', linewidth=0.8)
         trend = item['trend']
         lower.plot(dates, np.where(mask, trend['intercept']+trend['slope']*seconds/3600, np.nan),
-                   '--', label=f"Tendência da diferença: {trend['slope']:+.4g} ppm/h")
-        lower.set_title(f"RMSE={item['rmse']:.4g} ppm | MAE={item['mae']:.4g} ppm | r={fmt(item['correlation'])} | n={item['n']}")
+                   '--', label=f"Tendência da diferença: {trend['slope']:+.4g} {du}/h")
+        lower.set_title(f"RMSE={item['rmse']:.4g} {du} | MAE={item['mae']:.4g} {du} | r={fmt(item['correlation'])} | n={item['n']}")
         lower.legend(fontsize=9)
-        time_axis(lower, zone, first, last, 'Diferença (ppm)')
+        time_axis(lower, zone, first, last, f'Diferença ({du})')
     else:
         item = result['series'][key]
         ax = fig.add_subplot(111)
@@ -186,10 +205,10 @@ def analysis_figure(result, key, mode, zone, first, last):
         trend = item['trend']
         fitted = trend['intercept']+trend['slope']*seconds/3600
         ax.plot(dates, np.where(np.isfinite(item['values']), fitted, np.nan), '--',
-                label=f"Tendência: {trend['slope']:+.4g} ppm/h ({trend['direction']})")
-        ax.set_title(f"{item['name']} [{key}]\nR²={fmt(trend['r2'])} | variação ajustada={trend['change']:+.4g} ppm | n={trend['n']}")
+                label=f"Tendência: {trend['slope']:+.4g} {du}/h ({trend['direction']})")
+        ax.set_title(f"{item['name']} [{key}]\nR²={fmt(trend['r2'])} | variação ajustada={trend['change']:+.4g} {du} | n={trend['n']}")
         ax.legend(fontsize=9)
-        time_axis(ax, zone, first, last, 'CO₂ (ppm)')
+        time_axis(ax, zone, first, last, f"{info['label']} ({unit})")
     return fig
 
 
@@ -218,17 +237,18 @@ def load_sensors(params, timezone):
         ).fetchall()
 
 
-def load_readings(params, timezone, sensors, first, last):
+def load_readings(params, timezone, sensors, first, last, parameter='co2_ppm'):
+    parameter_info(parameter)
     data = {sid: (name, [], []) for sid, name in sensors}
     total = skipped = 0
     with connect(params, timezone) as conn:
-        with conn.cursor(name='co2_stream') as cur:
+        with conn.cursor(name='sensor_stream') as cur:
             cur.itersize = 10000
             cur.execute(
-                'SELECT s.id, r.reading_time, r.co2_ppm '
+                f'SELECT s.id, r.reading_time, r.{parameter} '
                 'FROM public.sensor s JOIN public.sensor_reading r ON s.id = r.sensor_id '
                 'WHERE s.id = ANY(%s) AND r.reading_time >= %s AND r.reading_time < %s '
-                'AND r.co2_ppm IS NOT NULL ORDER BY r.reading_time',
+                f'AND r.{parameter} IS NOT NULL ORDER BY r.reading_time',
                 ([sid for sid, _ in sensors], first, last)
             )
             zone = ZoneInfo(timezone)
@@ -250,7 +270,7 @@ def load_readings(params, timezone, sensors, first, last):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('Estufas — gráficos de CO₂')
+        self.title('Estufas — CO₂, temperatura e umidade')
         self.geometry('920x850')
         self.minsize(850, 790)
         self.events = queue.Queue()
@@ -286,6 +306,12 @@ class App(tk.Tk):
         choices.pack(fill='x', padx=12, pady=6)
         ttk.Button(choices, text='Selecionar todas', command=lambda: self.listbox.select_set(0, tk.END)).pack(side='left')
         ttk.Button(choices, text='Limpar seleção', command=lambda: self.listbox.select_clear(0, tk.END)).pack(side='left', padx=8)
+        self.parameter = tk.StringVar(value='CO₂')
+        ttk.Label(choices, text='Parâmetro:').pack(side='left', padx=(20, 5))
+        self.parameter_selector = ttk.Combobox(choices, textvariable=self.parameter,
+            values=[info['label'] for info in PARAMETERS.values()], state='readonly', width=16)
+        self.parameter_selector.pack(side='left')
+        self.parameter_selector.bind('<<ComboboxSelected>>', self.parameter_changed)
         period = ttk.LabelFrame(self, text='Período — DD/MM/AAAA HH:MM:SS (fim exclusivo)', padding=10)
         period.pack(fill='x', padx=12, pady=6)
         now = datetime.now(ZoneInfo('America/Sao_Paulo')).replace(microsecond=0)
@@ -304,7 +330,8 @@ class App(tk.Tk):
         ttk.Label(options, text='Offset vertical').grid(row=0, column=2, padx=5)
         ttk.Combobox(options, textvariable=self.offset_mode, values=OFFSET_MODES,
                      state='readonly', width=24).grid(row=0, column=3, padx=5)
-        ttk.Label(options, text='Tolerância (ppm/h)').grid(row=1, column=0, padx=5, pady=6)
+        self.tolerance_label = ttk.Label(options, text='Tolerância (ppm/h)')
+        self.tolerance_label.grid(row=1, column=0, padx=5, pady=6)
         ttk.Entry(options, textvariable=self.tolerance, width=10).grid(row=1, column=1, padx=5)
         ttk.Label(options, text='Médias por janela; sem preencher lacunas.').grid(row=1, column=2, columnspan=2)
         ttk.Button(options, text='Como interpretar', command=self.show_help).grid(row=0, column=4, rowspan=2, padx=8)
@@ -319,6 +346,15 @@ class App(tk.Tk):
         self.status = tk.StringVar(value='Configure a conexão e carregue as sondas.')
         ttk.Label(self, textvariable=self.status, wraplength=800).pack(fill='x', padx=16, pady=8)
         self.after(100, self.poll)
+
+    def selected_parameter(self):
+        return next(key for key, info in PARAMETERS.items() if info['label'] == self.parameter.get())
+
+    def parameter_changed(self, event=None):
+        info = parameter_info(self.selected_parameter())
+        self.tolerance_label.configure(text=f"Tolerância ({info['delta_unit']}/h)")
+        # Uma tolerância numérica em ppm/h não se aplica automaticamente a °C/h.
+        self.tolerance.set('0')
 
     def settings(self):
         params = {key: var.get() for key, var in self.fields.items() if key != 'timezone'}
@@ -388,6 +424,7 @@ class App(tk.Tk):
         try:
             params, timezone = self.settings()
             first, last, zone = parse_period(self.start.get(), self.end.get(), timezone)
+            parameter = self.selected_parameter()
             if mode in ('similarity', 'trend'):
                 step = float(self.step.get().replace(',', '.'))
                 tolerance = float(self.tolerance.get().replace(',', '.'))
@@ -399,22 +436,24 @@ class App(tk.Tk):
             return
         if mode in ('similarity', 'trend'):
             def work():
-                data, skipped = load_readings(params, timezone, selected, first, last)
-                return analyze(data, first, last, step, offset_mode, tolerance, pairs=mode == 'similarity'), skipped
+                data, skipped = load_readings(params, timezone, selected, first, last, parameter)
+                return analyze(data, first, last, step, offset_mode, tolerance, pairs=mode == 'similarity', parameter=parameter), skipped
             self.run_job(work, lambda result: self.show_analysis(result, mode, zone, first, last))
         else:
-            self.run_job(lambda: load_readings(params, timezone, selected, first, last),
-                         lambda result: self.show_plots(result, mode, zone, first, last))
+            self.run_job(lambda: load_readings(params, timezone, selected, first, last, parameter),
+                         lambda result: self.show_plots(result, mode, zone, first, last, parameter))
 
     def show_help(self):
         messagebox.showinfo('Como interpretar',
-            'A → B: diferença (B − offset) − A, em ppm. Offset é vertical, não temporal.\n\n'
+            'A → B: diferença (B − offset) − A. Offset é vertical, não temporal.\n\n'
             'Média das diferenças: subtrai de B a média de B−A nas janelas comuns. '
             'Primeiro ponto comum: usa apenas a primeira janela comum (mais sensível a ruído). '
             'Sem ajuste: preserva a diferença original.\n\n'
             'RMSE/MAE menores indicam curvas mais próximas. Pearson r próximo de +1 indica '
             'variação conjunta, mas não garante igualdade de valores.\n\n'
-            'Inclinação positiva = subida; negativa = descida. A tolerância, em ppm/h, '
+            'Unidades: CO₂ em ppm; temperatura em °C; umidade em %. Diferenças de umidade '
+            'são pontos percentuais (p.p.): de 60% para 65% = +5 p.p.\n\n'
+            'Inclinação positiva = subida; negativa = descida. A tolerância, na unidade de diferença por hora, '
             'define uma faixa em torno de zero. R² indica quanto a reta explica a variação. '
             'São estimativas descritivas, sem teste de significância.\n\n'
             'A tendência de uma sonda pode refletir mudanças ambientais. A tendência da '
@@ -425,20 +464,22 @@ class App(tk.Tk):
 
     def show_analysis(self, payload, mode, zone, first, last):
         result, skipped = payload
+        info = parameter_info(result['parameter'])
+        du = info['delta_unit']
         self.status.set(f"Análise concluída: janela de {result['step']:g} s; {skipped} valores não finitos ignorados.")
         window = tk.Toplevel(self)
-        window.title('CO₂ — ' + ('similaridade entre pares' if mode == 'similarity' else 'tendências'))
+        window.title(info['label'] + ' — ' + ('similaridade entre pares' if mode == 'similarity' else 'tendências'))
         window.geometry('1200x820')
         note = f"{first:%d/%m/%Y %H:%M:%S} a {last:%d/%m/%Y %H:%M:%S} (fim exclusivo) — {zone.key}\n"
-        note += f"Janela={result['step']:g} s | Offset={result['offset_mode']} | Tolerância={result['tolerance']:g} ppm/h"
+        note += f"Janela={result['step']:g} s | Offset={result['offset_mode']} | Tolerância={result['tolerance']:g} {du}/h"
         ttk.Label(window, text=note, padding=8).pack(fill='x')
         notebook = ttk.Notebook(window)
         notebook.pack(fill='both', expand=True)
         summary = ttk.Frame(notebook, padding=8)
         notebook.add(summary, text='Resumo')
         if mode == 'similarity':
-            headers = ['Par A → B', 'Janelas comuns', 'Cobertura (%)', 'Offset (ppm)', 'Média B-A (ppm)',
-                       'RMSE (ppm)', 'MAE (ppm)', 'Pearson r', 'Diferença (ppm/h)', 'R² diferença', 'Direção', 'Observação']
+            headers = ['Par A → B', 'Janelas comuns', 'Cobertura (%)', f'Offset ({du})', f'Média B-A ({du})',
+                       f'RMSE ({du})', f'MAE ({du})', 'Pearson r', f'Diferença ({du}/h)', 'R² diferença', 'Direção', 'Observação']
             rows, plots = [], []
             for i, item in enumerate(result['pairs']):
                 if 'error' in item:
@@ -452,7 +493,7 @@ class App(tk.Tk):
             explanation = 'Diferença = (B − offset) − A. RMSE/MAE após ajuste. Cobertura: janelas comuns / janelas do período.\nInclinação da diferença: divergência relativa. Correlação indefinida para séries constantes.'
         else:
             headers = ['Sonda', 'Leituras', 'Janelas válidas', 'Cobertura (%)', 'Horas cobertas',
-                       'ppm/h', 'ppm/dia', 'Variação ajustada (ppm)', 'R²', 'Direção', 'Observação']
+                       f'{du}/h', f'{du}/dia', f'Variação ajustada ({du})', 'R²', 'Direção', 'Observação']
             rows, plots = [], []
             for sid, item in result['series'].items():
                 trend = item['trend']
@@ -463,7 +504,7 @@ class App(tk.Tk):
                     rows.append([label, item['raw_n'], item['n'], fmt(100*item['n']/result['size']), fmt(trend['hours']),
                                  fmt(trend['slope']), fmt(trend['slope']*24), fmt(trend['change']), fmt(trend['r2']), trend['direction'], ''])
                     plots.append((sid, label))
-            explanation = 'Regressão linear das médias por janela; cada janela tem peso igual. Cobertura: janelas válidas / total.\nTendência descritiva do CO₂: não comprova drift instrumental. ppm/dia = ppm/h × 24; não é previsão.'
+            explanation = 'Regressão linear das médias por janela; cada janela tem peso igual. Cobertura: janelas válidas / total.\nTendência descritiva do parâmetro: não comprova drift instrumental. Taxa diária = taxa horária × 24; não é previsão.'
         ttk.Label(summary, text=explanation, wraplength=1100).pack(fill='x', pady=8)
         table_frame = ttk.Frame(summary)
         table_frame.pack(fill='both', expand=True)
@@ -505,14 +546,16 @@ class App(tk.Tk):
         notebook.bind('<<NotebookTabChanged>>', open_tab)
 
     def export_summary(self, headers, rows, result, first, last, zone):
-        path = filedialog.asksaveasfilename(parent=self, defaultextension='.csv', initialfile='resumo_co2.csv', filetypes=[('CSV', '*.csv')])
+        path = filedialog.asksaveasfilename(parent=self, defaultextension='.csv', initialfile=f"resumo_{result['parameter']}.csv", filetypes=[('CSV', '*.csv')])
         if not path:
             return
         try:
             with open(path, 'w', encoding='utf-8-sig', newline='') as output:
                 writer = csv.writer(output, delimiter=';')
                 writer.writerow(['Inicio', first.isoformat(), 'Fim_exclusivo', last.isoformat(), 'Fuso', zone.key])
-                writer.writerow(['Janela_segundos', result['step'], 'Offset', result['offset_mode'], 'Tolerancia_ppm_h', result['tolerance']])
+                info = parameter_info(result['parameter'])
+                writer.writerow(['Parametro', result['parameter'], 'Nome', info['label'], 'Unidade', info['unit'], 'Unidade_diferenca', info['delta_unit']])
+                writer.writerow(['Janela_segundos', result['step'], 'Offset', result['offset_mode'], f"Tolerancia_{info['delta_unit']}/h", result['tolerance']])
                 writer.writerow(headers)
                 writer.writerows(rows)
             messagebox.showinfo('Exportação', 'Resumo salvo.', parent=self)
@@ -520,19 +563,21 @@ class App(tk.Tk):
             messagebox.showerror('Exportação', str(exc), parent=self)
 
     def export_series(self, result, first, last, zone):
-        path = filedialog.asksaveasfilename(parent=self, defaultextension='.csv', initialfile='series_co2.csv', filetypes=[('CSV', '*.csv')])
+        path = filedialog.asksaveasfilename(parent=self, defaultextension='.csv', initialfile=f"series_{result['parameter']}.csv", filetypes=[('CSV', '*.csv')])
         if not path:
             return
         try:
             with open(path, 'w', encoding='utf-8-sig', newline='') as output:
                 writer = csv.writer(output, delimiter=';')
                 writer.writerow(['Inicio', first.isoformat(), 'Fim_exclusivo', last.isoformat(), 'Fuso', zone.key])
-                writer.writerow(['Janela_segundos', result['step'], 'Offset', result['offset_mode'], 'Tolerancia_ppm_h', result['tolerance']])
+                info = parameter_info(result['parameter'])
+                writer.writerow(['Parametro', result['parameter'], 'Nome', info['label'], 'Unidade', info['unit'], 'Unidade_diferenca', info['delta_unit']])
+                writer.writerow(['Janela_segundos', result['step'], 'Offset', result['offset_mode'], f"Tolerancia_{info['delta_unit']}/h", result['tolerance']])
                 series = list(result['series'].items())
                 pairs = [item for item in result['pairs'] if 'error' not in item]
-                writer.writerow(['Offsets_ppm'] + [f"{item['label']}: {item['offset']:.12g}" for item in pairs])
-                writer.writerow(['Centro_janela'] + [f"{item['name']} [{sid}] media_ppm" for sid, item in series]
-                                + [f"{item['label']} diferenca_ajustada_ppm" for item in pairs])
+                writer.writerow([f"Offsets ({info['delta_unit']})"] + [f"{item['label']}: {item['offset']:.12g}" for item in pairs])
+                writer.writerow(['Centro_janela'] + [f"{item['name']} [{sid}] media ({info['unit']})" for sid, item in series]
+                                + [f"{item['label']} diferenca_ajustada ({info['delta_unit']})" for item in pairs])
                 for i, date in enumerate(result['dates']):
                     values = [item['values'][i] for _, item in series] + [item['delta'][i] for item in pairs]
                     writer.writerow([date.isoformat()] + [float(value) if np.isfinite(value) else '' for value in values])
@@ -540,7 +585,8 @@ class App(tk.Tk):
         except OSError as exc:
             messagebox.showerror('Exportação', str(exc), parent=self)
 
-    def show_plots(self, result, mode, zone, first, last):
+    def show_plots(self, result, mode, zone, first, last, parameter='co2_ppm'):
+        info = parameter_info(parameter)
         data, skipped = result
         populated = [(sid, record) for sid, record in data.items() if record[1]]
         empty = [f'{record[0]} [ID: {sid}]' for sid, record in data.items() if not record[1]]
@@ -551,24 +597,25 @@ class App(tk.Tk):
         if not populated:
             return
         window = tk.Toplevel(self)
-        window.title('CO₂ — ' + ('superpostos' if mode == 'overlay' else 'isolados'))
+        window.title(info['label'] + ' — ' + ('superpostos' if mode == 'overlay' else 'isolados'))
         window.geometry('1050x740')
         if mode == 'overlay':
-            self.plot_frame(window, populated, zone, first, last)
+            self.plot_frame(window, populated, zone, first, last, parameter)
         else:
             notebook = ttk.Notebook(window)
             notebook.pack(fill='both', expand=True)
             for sid, record in populated:
                 frame = ttk.Frame(notebook)
                 notebook.add(frame, text=f'{record[0]} [ID: {sid}]')
-                self.plot_frame(frame, [(sid, record)], zone, first, last)
+                self.plot_frame(frame, [(sid, record)], zone, first, last, parameter)
 
-    def plot_frame(self, parent, series, zone, first, last):
+    def plot_frame(self, parent, series, zone, first, last, parameter='co2_ppm'):
+        info = parameter_info(parameter)
         fig = Figure(figsize=(10, 6), dpi=100, layout='constrained')
         ax = fig.add_subplot(111)
         for sid, (name, dates, values) in series:
             ax.plot(dates, values, linewidth=1, label=f'{name} [ID: {sid}]')
-        ax.set(title='Concentração de CO₂', xlabel=f'Data e hora — {zone.key}', ylabel='CO₂ (ppm)')
+        ax.set(title=info['label'], xlabel=f'Data e hora — {zone.key}', ylabel=f"{info['label']} ({info['unit']})")
         ax.set_xlim(first, last)
         ax.grid(True, alpha=0.3)
         ax.legend(loc='best', fontsize=9)
