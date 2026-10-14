@@ -46,6 +46,11 @@ ANÁLISES (os gráficos originais continuam usando as leituras brutas):
   RMSE complementar remove o offset médio local, mas preserva diferenças
   de amplitude. Nenhuma correção de atraso temporal é aplicada.
   Janelas sobrepostas não são observações independentes; análise descritiva.
+  Legenda: média temporal = sum(r_i)/K, para janelas válidas de avanço fixo.
+  Complemento: resumo Fisher = tanh(mean(atanh(r_i))), sem pesos n-3.
+  Fisher não é a média temporal e fica indisponível se houver |r|=1;
+  não se usa clipping arbitrário. Lacunas não são substituídas por zero.
+  Nenhum dos resumos é a correlação global calculada com todos os pontos.
 - Resumos e séries analisadas podem ser exportados em CSV (UTF-8, ';').
 """
 import math
@@ -250,6 +255,30 @@ def rolling_correlation(data, first, last, parameter='co2_ppm', base=60,
                 min_points=min_points, coverage=coverage, min_std=min_std)
 
 
+def correlation_summary(records):
+    """Resumo descritivo da trajetória r(t), apenas nos centros válidos.
+
+    Média temporal discreta = sum(r_i)/K, pois o avanço é constante.
+    Fisher = tanh(mean(atanh(r_i))) é outro resumo, não a média de r(t).
+    Sem pesos n-3, IC ou teste: há sobreposição e autocorrelação temporal.
+    Fisher fica indisponível se houver |r|=1, sem clipping arbitrário.
+    """
+    values = np.asarray([row['r'] for row in records], dtype=float)
+    valid = values[np.isfinite(values)]
+    if np.any(np.abs(valid) > 1):
+        raise ValueError('Correlação fora de [-1, 1].')
+    summary = dict(total=len(values), valid=len(valid), mean=None, fisher=None,
+                   fisher_status='Sem janelas válidas')
+    if len(valid):
+        summary['mean'] = float(np.mean(valid))
+        if np.any(np.abs(valid) == 1):
+            summary['fisher_status'] = 'Indisponível: existe r=+1 ou r=-1 (atanh singular)'
+        else:
+            summary['fisher'] = float(np.tanh(np.mean(np.arctanh(valid))))
+            summary['fisher_status'] = 'OK; pesos iguais por janela válida'
+    return summary
+
+
 def rolling_figure(result, zone):
     info = parameter_info(result['parameter'])
     aligned, records = result['aligned'], result['records']
@@ -262,6 +291,16 @@ def rolling_figure(result, zone):
     axes[0].set_title(f"{info['label']} — correlação móvel: {result['window']/60:g} min, avanço {result['advance']/60:g} min")
     axes[0].legend(fontsize=8)
     axes[1].plot(dates, [r['r'] for r in records], '.-', markersize=3, label='Pearson r')
+    summary = correlation_summary(records)
+    if summary['mean'] is not None:
+        axes[1].axhline(summary['mean'], color='tab:red', linestyle='--', linewidth=1.2,
+                        label=f"Média temporal r = {summary['mean']:.4f}")
+    else:
+        axes[1].plot([], [], color='tab:red', label='Média temporal: indisponível')
+    fisher_label = (f"Resumo Fisher z → r = {summary['fisher']:.4f}" if summary['fisher'] is not None
+                    else 'Fisher: indisponível (r=±1 ou sem dados)')
+    axes[1].plot([], [], color='none', label=fisher_label)
+    axes[1].legend(loc='best', fontsize=8, title=f"Janelas válidas: {summary['valid']}/{summary['total']}", title_fontsize=8)
     axes[1].axhline(0, color='gray', linewidth=.7)
     axes[1].set_ylim(-1.05, 1.05)
     axes[2].plot(dates, [r['rmse'] for r in records], '.-', markersize=3, color='tab:orange')
@@ -289,6 +328,13 @@ def write_rolling_csv(path, result):
                          'Sonda_B', result['ids'][1], result['aligned']['series'][result['ids'][1]]['name']])
         writer.writerow(['Base_s', result['base'], 'Janela_s', result['window'], 'Avanco_s', result['advance'],
                          'Min_pontos', result['min_points'], 'Cobertura_min_pct', result['coverage'], 'Desvio_min', result['min_std']])
+        summary = correlation_summary(result['records'])
+        writer.writerow(['Media_temporal_r', summary['mean'] if summary['mean'] is not None else '',
+                         'Resumo_Fisher_z_para_r', summary['fisher'] if summary['fisher'] is not None else '',
+                         'Janelas_validas', summary['valid'], 'Janelas_totais', summary['total']])
+        writer.writerow(['Metodo_media', 'sum(r_i)/K; pesos iguais; apenas janelas validas',
+                         'Metodo_Fisher', 'tanh(mean(atanh(r_i))); pesos iguais', 'Status_Fisher', summary['fisher_status']])
+        writer.writerow(['Interpretacao', 'Resumos descritivos; janelas sobrepostas dependentes; sem IC ou teste de significancia'])
         writer.writerow(['Inicio_janela', 'Fim_exclusivo_janela', 'Centro_janela', 'N_pares', 'Cobertura_pct',
                          'Pearson_r', f"RMSE_sem_offset_{info['delta_unit']}", f"Offset_medio_B-A_{info['delta_unit']}",
                          f"Desvio_A_{info['delta_unit']}", f"Desvio_B_{info['delta_unit']}", 'Status'])
@@ -650,7 +696,9 @@ class App(tk.Tk):
         note = (f"{valid}/{len(records)} janelas com Pearson válido | base={result['base']:g} s | "
                 f"mínimo={result['min_points']} pontos e {result['coverage']:g}% de cobertura\n"
                 'Lacunas = dados ou variação insuficientes; não equivalem a r=0. '
-                'Pearson ignora offset e escala; RMSE sem offset complementa a comparação de amplitude.')
+                'Pearson ignora offset e escala; RMSE sem offset complementa a comparação de amplitude.\n'
+                'Média temporal: peso igual por janela válida. Fisher: resumo na escala z. '
+                'Janelas sobrepostas são dependentes; os valores são descritivos. Sinais opostos podem se cancelar na média.')
         ttk.Label(window, text=note, wraplength=1100, padding=8).pack(fill='x')
         ttk.Button(window, text='Exportar correlação móvel CSV',
                    command=lambda: self.export_rolling(result)).pack(pady=4)
